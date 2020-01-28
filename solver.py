@@ -16,6 +16,10 @@ from miasm.arch.x86.arch import conditional_branch
 from miasm.analysis.machine import Machine
 from miasm.expression.expression import Expr, LocKey, ExprId
 
+
+__ver_minor__ = 1
+__ver_major__ = 0
+
 LOG_LEVEL = 2
 
 
@@ -178,7 +182,7 @@ class IDALifter:
 
 
 class IDAFlowRecovery(IDALifter):
-    def __init__(self, ea: int, stream: bin_stream, arch: int, ids_check=True, mem_check=True):
+    def __init__(self, ea: int, stream: bin_stream, arch: int, ids_check=True, mem_check=True, verbose_log=False):
         self._ea = ea
 
         super().__init__(arch, stream)
@@ -187,6 +191,7 @@ class IDAFlowRecovery(IDALifter):
 
         self._ids_check = ids_check
         self._mem_check = mem_check
+        self._verbose_log = verbose_log
 
         self._flow_patches_map = {}
         self._branch_conditions = []
@@ -208,6 +213,8 @@ class IDAFlowRecovery(IDALifter):
         for ir_loc, ir_block in self._ir_cfg.blocks.items():
             # check for detect current location that is head or tail of natural loop
 
+            loc_addr = self._ir_cfg.loc_db.get_location_offset(ir_loc)
+
             is_head, _ = self._is_loop_head(ir_loc)
             is_tail, _ = self._is_loop_tail(ir_loc)
 
@@ -218,21 +225,30 @@ class IDAFlowRecovery(IDALifter):
 
             dst_solutions = set()
 
+            solutions_log = []
+
             for sol in dg.get(ir_loc, [self.ip], ir_block.assignblks[-1].instr.offset, set()):
                 try:
                     solutions = sol.emul(self._ir_arch)
                 except NotImplementedError as ex:
                     log(f"Unsupported expression in location - {ir_loc}", code='!')
 
+                    solutions_log.append((ir_loc, ir_block, None))
+
                     dst_solutions = set()
                     break
 
                 ip_expr = solutions.get(self.ip)
 
-                # print(f"{ir_loc} - {hex(self._ir_cfg.loc_db.get_location_offset(ir_loc))} - {ip_expr}")
+                solutions_log.append((ir_loc, ir_block, ip_expr))
 
                 if not ip_expr.is_int() and not ip_expr.is_loc() and not is_static_expr(ip_expr):
                     dst_solutions = set()
+
+                    known_dst = self._flow_patches_map.get(loc_addr, None)
+                    if known_dst:
+                        del self._flow_patches_map[loc_addr]
+
                     break
 
                 if not ip_expr.is_int() and not ip_expr.is_loc():
@@ -241,9 +257,24 @@ class IDAFlowRecovery(IDALifter):
                     # invlidate dst_solutions
                     dst_solutions = set()
 
+                    known_dst = self._flow_patches_map.get(loc_addr, None)
+                    if known_dst:
+                        del self._flow_patches_map[loc_addr]
+
                     break
 
                 dst_solutions.update([ip_expr])
+
+            if self._verbose_log:
+                vl_pad = 24
+                for ir_loc, ir_block, ip_expr in solutions_log:
+                    print(f"{'-' * vl_pad}")
+                    print(f"{ir_loc} - {hex(loc_addr)if loc_addr else 'None'}")
+                    for assign_block in ir_block.assignblks:
+                        for dst, src in assign_block.iteritems():
+                            print(f"{dst} = {src}")
+                    print(f"{'-' * vl_pad}")
+                    print(f"Solution: {ip_expr}")
 
             if len(dst_solutions) != 1:
                 continue
@@ -255,7 +286,16 @@ class IDAFlowRecovery(IDALifter):
                 log(f"Oops ... {static_dst}. Fail resolve dst by a simple approach", code='!')
                 continue
 
-            self._flow_patches_map[self._ir_cfg.loc_db.get_location_offset(ir_loc)] = static_addr
+            known_dst = self._flow_patches_map.get(loc_addr, None)
+            if known_dst is None:
+                self._flow_patches_map[loc_addr] = static_addr
+            elif self._flow_patches_map[loc_addr] != static_addr:
+                # We found in another path different static solution, not opaque jmp
+                del self._flow_patches_map[loc_addr]
+
+        if self._verbose_log:
+            for l, d in self._flow_patches_map.items():
+                print(f"{hex(l)} -> {hex(d)}")
 
     def apply(self):
         """
@@ -263,13 +303,15 @@ class IDAFlowRecovery(IDALifter):
         :return: None
         """
         for src, dst in self._flow_patches_map.items():
-            asm_block: AsmBlock = self._mdis.dis_block(src)
+            ir_block: IRBlock = self._ir_cfg.get_block(src)
 
-            if asm_block.lines[-1].name not in conditional_branch:
+            asm_instr = ir_block.assignblks[ir_block.dst_linenb].instr
+
+            if asm_instr.name not in conditional_branch:
                 log(f"Unsupported asm pattern at {hex(src)}", code='!')
                 continue
 
-            patch_addr = asm_block.lines[-1].offset
+            patch_addr = asm_instr.offset
 
             opcode1 = ida_bytes.get_byte(patch_addr)
 
@@ -285,5 +327,38 @@ class IDAFlowRecovery(IDALifter):
             log(f"Apply patch JCC -> JMP at {hex(patch_addr)}")
 
 
-ifr = IDAFlowRecovery(kw.get_screen_ea(), get_stream(), get_target_arch())
-ifr.apply()
+class StartDialog(kw.Form):
+    def __init__(self, version=f"{__ver_major__}{__ver_minor__}"):
+        kw.Form.__init__(self, f"""Miasm CFG deobfuscator for IDA. v{version}
+                        {{FormChangeCb}}
+                        <#Enter start address:{{iAddr}}> 
+                        <#Disable patch:{{rMode}}>
+                        <#Verbose logging:{{rModeLogging}}>{{cModeGroup1}}>
+                        """, {'iAddr': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=kw.get_screen_ea()),
+                              'cModeGroup1': idaapi.Form.ChkGroupControl(("rMode", "rModeLogging",)),
+                              'FormChangeCb': idaapi.Form.FormChangeCb(self.OnFormChange)})
+
+    def OnFormChange(self, fid):
+        if fid == self.rMode.id:
+            self.rMode.checked = not self.rMode.checked
+        elif fid == self.rMode.id:
+            self.rModeLogging.checked = not self.rModeLogging.checked
+        return 1
+
+
+def main():
+    sd = StartDialog()
+    sd.Compile()
+    ok = sd.Execute()
+    if ok:
+        if not sd.iAddr.value:
+            log("Start address must be set", code='~')
+            return
+
+        ifr = IDAFlowRecovery(sd.iAddr.value, get_stream(), get_target_arch(), verbose_log=sd.rModeLogging.checked)
+        if not sd.rMode.checked:
+            ifr.apply()
+
+
+if __name__ == '__main__':
+    main()
