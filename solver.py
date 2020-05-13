@@ -14,13 +14,16 @@ from miasm.ir.ir import IRBlock, IRCFG
 from miasm.core.asmblock import AsmCFG, AsmBlock
 from miasm.arch.x86.arch import conditional_branch
 from miasm.analysis.machine import Machine
-from miasm.expression.expression import Expr, LocKey, ExprId
+from miasm.expression.expression import Expr, LocKey, ExprId, ExprInt
+from miasm.arch.x86.regs import all_regs_ids, EAX, RAX, ECX, RCX, EDX, RDX, EBX, RBX, ESI, RSI, EDI, RDI, ESP, RSP, \
+    EBP, RBP
 
 
 __ver_minor__ = 1
 __ver_major__ = 0
 
 LOG_LEVEL = 2
+REGISTER_DEFAULT_VALUE = 0xffffffff
 
 
 def log(msg, code='+'):
@@ -91,6 +94,42 @@ def simple_unwrap_expr(expr: Expr, loc_db: LocationDB):
             ra = -1
 
     return ra
+
+
+def get_ax():
+    return RAX if get_target_arch() == 64 else EAX
+
+
+def get_bx():
+    return RBX if get_target_arch() == 64 else EBX
+
+
+def get_cx():
+    return RCX if get_target_arch() == 64 else ECX
+
+
+def get_dx():
+    return RDX if get_target_arch() == 64 else EDX
+
+
+def get_si():
+    return RSI if get_target_arch() == 64 else ESI
+
+
+def get_di():
+    return RDI if get_target_arch() == 64 else EDI
+
+
+def get_sp():
+    return RSP if get_target_arch() == 64 else ESP
+
+
+def get_bp():
+    return RBP if get_target_arch() == 64 else EBP
+
+
+def get_sym_ptr(v):
+    return ExprInt(v, get_target_arch())
 
 
 IRLoop = namedtuple("IRLoop", "head tail body")
@@ -182,7 +221,8 @@ class IDALifter:
 
 
 class IDAFlowRecovery(IDALifter):
-    def __init__(self, ea: int, stream: bin_stream, arch: int, ids_check=True, mem_check=True, verbose_log=False):
+    def __init__(self, ea: int, stream: bin_stream, arch: int, ids_check=True, mem_check=True, verbose_log=False,
+                 ctx=None):
         self._ea = ea
 
         super().__init__(arch, stream)
@@ -196,13 +236,13 @@ class IDAFlowRecovery(IDALifter):
         self._flow_patches_map = {}
         self._branch_conditions = []
 
-        self._mark_branch_conditions()
+        self._mark_branch_conditions(ctx=ctx)
 
     @property
     def flow_fixes(self):
         return self._flow_patches_map
 
-    def _mark_branch_conditions(self):
+    def _mark_branch_conditions(self, ctx=None):
         """
         For any cjmp in CFG tries to find all solutions for []IP symbol
         :return:
@@ -229,7 +269,7 @@ class IDAFlowRecovery(IDALifter):
 
             for sol in dg.get(ir_loc, [self.ip], ir_block.assignblks[-1].instr.offset, set()):
                 try:
-                    solutions = sol.emul(self._ir_arch)
+                    solutions = sol.emul(self._ir_arch, ctx=ctx)
                 except NotImplementedError as ex:
                     log(f"Unsupported expression in location - {ir_loc}", code='!')
 
@@ -302,6 +342,7 @@ class IDAFlowRecovery(IDALifter):
         Apply patches to found opaque branch
         :return: None
         """
+
         for src, dst in self._flow_patches_map.items():
             ir_block: IRBlock = self._ir_cfg.get_block(src)
 
@@ -317,9 +358,10 @@ class IDAFlowRecovery(IDALifter):
 
             # Fast and Furious
             if opcode1 == 0x0F:
-                ida_bytes.patch_bytes(patch_addr, b"\xe9" + pack("<I", (dst - (patch_addr + 5) & (2**32 - 1))))
+                ida_bytes.patch_bytes(patch_addr, b"\xe9" + pack("<I", (dst - (patch_addr + 5)) & (2**32 - 1)))
             elif ((opcode1 & 0xe0) == 0xe0) or ((opcode1 & 0x70) == 0x70):
                 ida_bytes.patch_byte(patch_addr, 0xeb)
+                ida_bytes.patch_byte(patch_addr + 1, (dst - (patch_addr + 2)) & 0xFF)
             else:
                 log(f"Unknown first part of opcode at {hex(patch_addr)}", code='!')
                 continue
@@ -331,12 +373,28 @@ class StartDialog(kw.Form):
     def __init__(self, version=f"{__ver_major__}{__ver_minor__}"):
         kw.Form.__init__(self, f"""Miasm CFG deobfuscator for IDA. v{version}
                         {{FormChangeCb}}
-                        <#Enter start address:{{iAddr}}> 
+                        <#Entry  : {{iAddr}}> 
+                        <#(E/R)AX:{{iAX}}>
+                        <#(E/R)DX:{{iDX}}>
+                        <#(E/R)CX:{{iCX}}>
+                        <#(E/R)BX:{{iBX}}>
+                        <#(E/R)SI:{{iSI}}> 
+                        <#(E/R)DI:{{iDI}}>
+                        <#(E/R)SP:{{iSP}}>
+                        <#(E/R)BP:{{iBP}}>
                         <#Disable patch:{{rMode}}>
                         <#Verbose logging:{{rModeLogging}}>{{cModeGroup1}}>
                         """, {'iAddr': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=kw.get_screen_ea()),
                               'cModeGroup1': idaapi.Form.ChkGroupControl(("rMode", "rModeLogging",)),
-                              'FormChangeCb': idaapi.Form.FormChangeCb(self.OnFormChange)})
+                              'FormChangeCb': idaapi.Form.FormChangeCb(self.OnFormChange),
+                              'iAX': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iDX': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iCX': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iBX': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iSI': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iDI': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iSP': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),
+                              'iBP': kw.Form.NumericInput(tp=idaapi.Form.FT_ADDR, value=REGISTER_DEFAULT_VALUE),})
 
     def OnFormChange(self, fid):
         if fid == self.rMode.id:
@@ -355,7 +413,34 @@ def main():
             log("Start address must be set", code='~')
             return
 
-        ifr = IDAFlowRecovery(sd.iAddr.value, get_stream(), get_target_arch(), verbose_log=sd.rModeLogging.checked)
+        concrete_context = {}
+
+        if sd.iAX.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_ax()] = get_sym_ptr(sd.iAX.value)
+
+        if sd.iDX.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_dx()] = get_sym_ptr(sd.iDX.value)
+
+        if sd.iCX.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_cx()] = get_sym_ptr(sd.iCX.value)
+
+        if sd.iBX.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_bx()] = get_sym_ptr(sd.iBX.value)
+
+        if sd.iSI.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_si()] = get_sym_ptr(sd.iSI.value)
+
+        if sd.iDI.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_di()] = get_sym_ptr(sd.iDI.value)
+
+        if sd.iSP.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_sp()] = get_sym_ptr(sd.iSP.value)
+
+        if sd.iBP.value != REGISTER_DEFAULT_VALUE:
+            concrete_context[get_bp()] = get_sym_ptr(sd.iBP.value)
+
+        ifr = IDAFlowRecovery(sd.iAddr.value, get_stream(), get_target_arch(),
+                              verbose_log=sd.rModeLogging.checked, ctx=concrete_context)
         if not sd.rMode.checked:
             ifr.apply()
 
